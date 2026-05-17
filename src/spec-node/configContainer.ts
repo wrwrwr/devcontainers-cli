@@ -159,7 +159,9 @@ function deepMergeOrReplace<T extends object>(base: T, overrides: Overrides<T>):
 		} else {
 			const baseKey = key as keyof T;
 			const baseValue = base[baseKey];
-			if (isObject(baseValue) && isObject(override)) {
+			if (Array.isArray(baseValue) && Array.isArray(override)) {
+				merged[baseKey] = [...baseValue, ...override] as T[typeof baseKey];
+			} else if (isObject(baseValue) && isObject(override)) {
 				merged[baseKey] = deepMergeOrReplace(baseValue, override);
 			} else {
 				merged[baseKey] = override as T[typeof baseKey];
