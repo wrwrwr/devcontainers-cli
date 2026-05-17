@@ -15,12 +15,12 @@ import { ContainerError } from '../spec-common/errors';
 import { Workspace, workspaceFromPath, isWorkspacePath } from '../spec-utils/workspaces';
 import { URI } from 'vscode-uri';
 import { CLIHost } from '../spec-common/commonUtils';
-import { Log } from '../spec-utils/log';
+import { Log, LogLevel } from '../spec-utils/log';
 import { getDefaultDevContainerConfigPath, getDevContainerConfigPathIn } from '../spec-configuration/configurationCommonUtils';
 import { DevContainerConfig, DevContainerFromDockerComposeConfig, DevContainerFromDockerfileConfig, DevContainerFromImageConfig, updateFromOldProperties } from '../spec-configuration/configuration';
 import { ensureNoDisallowedFeatures } from './disallowedFeatures';
 import { DockerCLIParameters } from '../spec-shutdown/dockerUtils';
-import { createDocuments } from '../spec-configuration/editableFiles';
+import { createDocuments, Documents } from '../spec-configuration/editableFiles';
 
 
 export async function resolve(params: DockerResolverParameters, configFile: URI | undefined, overrideConfigFile: URI | undefined, providedIdLabels: string[] | undefined, additionalFeatures: Record<string, string | boolean | Record<string, string | boolean>>): Promise<ResolverResult> {
@@ -85,7 +85,8 @@ export async function readDevContainerConfigFile(cliHost: CLIHost, workspace: Wo
 	if (!content) {
 		return undefined;
 	}
-	const raw = jsonc.parse(content) as DevContainerConfig | undefined;
+	let raw = jsonc.parse(content) as DevContainerConfig | undefined;
+	raw = await applyLocalOverrides(documents, overrideConfigFile ?? configFile, output, raw);
 	const updated = raw && updateFromOldProperties(raw);
 	if (!updated || typeof updated !== 'object' || Array.isArray(updated)) {
 		throw new ContainerError({ description: `Dev container config (${uriToFsPath(configFile, cliHost.platform)}) must contain a JSON object literal.` });
@@ -114,4 +115,60 @@ export async function readDevContainerConfigFile(cliHost: CLIHost, workspace: Wo
 		},
 		workspaceConfig,
 	};
+}
+
+const replacePrefix = 'replace:';
+const removePrefix = 'remove:';
+
+type AddPrefix<T extends object, P extends string> = {
+	[K in Extract<keyof T, string> as `${P}${K}`]: T[K]
+};
+
+type Overrides<T extends object> = Partial<T & AddPrefix<T, typeof replacePrefix> & AddPrefix<T, typeof removePrefix>>;
+
+export async function applyLocalOverrides(documents: Documents, configFile: URI, output: Log, baseRaw: DevContainerConfig | undefined): Promise<DevContainerConfig | undefined> {
+	const localConfig = configFile.with({ path: configFile.path.replace('.json', '.local.json') });
+	output.write(`devcontainers local mod: looking for: ${localConfig}`, LogLevel.Debug);
+	const localContent = await documents.readDocument(localConfig);
+	if (!localContent) {
+		output.write(`devcontainers local mod: local config not found`, LogLevel.Debug);
+		return baseRaw;
+	}
+	output.write(`devcontainers local mod: found local config`, LogLevel.Debug);
+	const localRaw = jsonc.parse(localContent) as Partial<DevContainerConfig> | undefined;
+	if (!localRaw) {
+		return baseRaw;
+	}
+	if (baseRaw === undefined) {
+		baseRaw = {};
+	}
+	const merged = deepMergeOrReplace(baseRaw, localRaw);
+	output.write(`devcontainers local mod: merged config: ${JSON.stringify(merged)}`, LogLevel.Debug);
+	return merged;
+}
+
+function deepMergeOrReplace<T extends object>(base: T, overrides: Overrides<T>): T {
+	const merged = { ...base } as T;
+	for (let [key, override] of Object.entries(overrides)) {
+		if (key.startsWith(replacePrefix)) {
+			const baseKey = key.substring(replacePrefix.length) as keyof T;
+			merged[baseKey] = override as T[keyof T];
+		} else if (key.startsWith(removePrefix)) {
+			const baseKey = key.substring(removePrefix.length) as keyof T;
+			delete merged[baseKey];
+		} else {
+			const baseKey = key as keyof T;
+			const baseValue = base[baseKey];
+			if (isObject(baseValue) && isObject(override)) {
+				merged[baseKey] = deepMergeOrReplace(baseValue, override);
+			} else {
+				merged[baseKey] = override as T[typeof baseKey];
+			}
+		}
+	}
+	return merged;
+}
+
+function isObject<T>(value: T): value is NonNullable<T & object> {
+	return typeof value === 'object' && value !== null;
 }
